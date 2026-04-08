@@ -23,9 +23,10 @@ CAMERA_INDEX = 0
 RECOGNITION_TOLERANCE = 0.45       # Lower = stricter matching (default lib is 0.6)
 PROCESS_SCALE = 0.35               # Scale factor for detection (smaller = faster)
 NUM_JITTERS = 1                    # Jitters for LIVE detection (1 = fast, accurate enough)
-REG_NUM_JITTERS = 10               # High jitters during registration for rich encodings
-REG_SAMPLES_TARGET = 10            # How many face samples to capture during registration
-REG_SAMPLES_MIN = 5                # Minimum required or registration fails
+REG_SAMPLES_TARGET = 50            # 50 samples for maximum accuracy
+REG_SAMPLES_MIN = 20               # At least 20 or fail
+REG_NUM_JITTERS = 1                # Use 1 jitter during rapid capture (speed) — 50 samples compensate
+REG_TIMEOUT = 10                   # Capture window in seconds
 DETECTION_MODEL = "hog"            # "hog" (fast, CPU) or "cnn" (slow, GPU/accurate)
 CAMERA_WIDTH = 640                 # 640x480 is fastest for streaming; AI still works well
 CAMERA_HEIGHT = 480
@@ -498,37 +499,64 @@ def get_attendance():
     return jsonify(df.to_dict('records'))
 
 
+# Registration progress (thread-safe for polling)
+_reg_progress = {"active": False, "samples": 0, "target": REG_SAMPLES_TARGET, "name": ""}
+_reg_lock = threading.Lock()
+
+
+@app.route('/api/register/status', methods=['GET'])
+def register_status():
+    """Frontend polls this to show real-time sample count."""
+    with _reg_lock:
+        return jsonify(_reg_progress)
+
+
 @app.route('/api/register', methods=['POST'])
 def register_student():
     """
-    High-accuracy registration:
-    - Captures multiple face samples from the camera
-    - Uses high num_jitters for rich 128-d encodings
-    - Stores all samples in a .pkl file for voting-based matching
+    High-speed 50-sample registration:
+    - Captures up to 50 face encodings in 10 seconds
+    - Uses num_jitters=1 per frame for speed (quantity over per-frame quality)
+    - 50 diverse samples = much better voting accuracy than 5 high-jitter samples
+    - Filters: only keeps the largest face, skips blurry/bad frames
     """
     data = request.json
     sid, name = data.get('id'), data.get('name')
     if not sid or not name:
         return jsonify({"success": False, "message": "Missing ID/Name"}), 400
 
+    # Initialize progress
+    with _reg_lock:
+        _reg_progress.update({"active": True, "samples": 0, "target": REG_SAMPLES_TARGET, "name": name})
+
     encodings = []
-    print(f"📸 Starting high-accuracy capture for {name} (ID: {sid})")
+    print(f"📸 Starting rapid capture for {name} (ID: {sid}) — target: {REG_SAMPLES_TARGET} in {REG_TIMEOUT}s")
 
     # Flush stale buffered frames
-    for _ in range(8):
+    for _ in range(10):
         cam_mgr.get_frame()
 
-    for i in range(25):  # More attempts to ensure enough samples
-        time.sleep(0.15)
+    start_time = time.time()
+    attempt = 0
+
+    while time.time() - start_time < REG_TIMEOUT and len(encodings) < REG_SAMPLES_TARGET:
+        attempt += 1
         success, frame = cam_mgr.get_frame()
         if not success or frame is None:
+            time.sleep(0.01)
             continue
 
-        rgb = self_preprocess(frame)
+        # Quick blur check — skip very blurry frames
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < 50:  # Too blurry
+            continue
+
+        rgb = reg_preprocess(frame)
         try:
             locs = face_recognition.face_locations(rgb, model=DETECTION_MODEL)
             if locs:
-                # Use only the largest face (closest to camera) for registration
+                # Pick the largest face (closest to camera)
                 if len(locs) > 1:
                     areas = [(b - t) * (r - l) for (t, r, b, l) in locs]
                     largest_idx = np.argmax(areas)
@@ -537,22 +565,33 @@ def register_student():
                 encs = face_recognition.face_encodings(rgb, locs, num_jitters=REG_NUM_JITTERS)
                 if encs:
                     encodings.append(encs[0])
-                    print(f"  ✅ Sample {len(encodings)}/{REG_SAMPLES_TARGET} captured")
-            else:
-                print(f"  ◽ Attempt {i+1}: No face visible")
+
+                    # Update progress for polling
+                    with _reg_lock:
+                        _reg_progress["samples"] = len(encodings)
+
+                    if len(encodings) % 10 == 0 or len(encodings) == 1:
+                        elapsed = round(time.time() - start_time, 1)
+                        print(f"  ✅ {len(encodings)}/{REG_SAMPLES_TARGET} samples ({elapsed}s elapsed)")
         except Exception as e:
-            print(f"  ⚠️ Capture error at attempt {i+1}: {e}")
+            print(f"  ⚠️ Capture error at attempt {attempt}: {e}")
+            continue
 
-        if len(encodings) >= REG_SAMPLES_TARGET:
-            break
+        # Tiny sleep to allow camera buffer to refresh
+        time.sleep(0.02)
 
-    print(f"📊 Capture finished. Total samples: {len(encodings)}")
+    elapsed = round(time.time() - start_time, 1)
+    print(f"📊 Capture finished: {len(encodings)} samples in {elapsed}s ({attempt} frames processed)")
+
+    # Mark progress as complete
+    with _reg_lock:
+        _reg_progress.update({"active": False, "samples": len(encodings)})
 
     if len(encodings) < REG_SAMPLES_MIN:
         return jsonify({
             "success": False,
-            "message": f"Only captured {len(encodings)}/{REG_SAMPLES_MIN} face samples. "
-                       f"Please look directly at the camera and ensure good lighting."
+            "message": f"Only captured {len(encodings)}/{REG_SAMPLES_MIN} samples in {elapsed}s. "
+                       f"Ensure good lighting and look directly at the camera."
         }), 400
 
     # Save dataset
@@ -568,17 +607,22 @@ def register_student():
     with db_mgr.get_connection() as conn:
         conn.execute("INSERT OR REPLACE INTO students (id, name) VALUES (?, ?)", (sid, name))
         conn.commit()
-        print(f"🗄️ Database entry created for {name}")
+        print(f"🗄️ Student '{name}' registered with {len(encodings)} face samples")
 
     attendance_svc.load_known_faces()
-    return jsonify({"success": True, "message": f"Successfully registered {name} with {len(encodings)} face samples"}), 201
+    return jsonify({
+        "success": True,
+        "message": f"Registered {name} with {len(encodings)} face samples in {elapsed}s"
+    }), 201
 
 
-def self_preprocess(frame):
-    """Preprocess a frame for face_recognition (used during registration)."""
-    small = cv2.resize(frame, (0, 0), fx=PROCESS_SCALE, fy=PROCESS_SCALE)
+def reg_preprocess(frame):
+    """Preprocess a frame for registration (slightly higher res than live detection)."""
+    # Use 0.5 scale for registration — better detail than live detection's 0.35
+    small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
     rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
     return np.ascontiguousarray(rgb, dtype=np.uint8)
+
 
 
 # =============================================================================
