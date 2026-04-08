@@ -101,3 +101,8 @@ export const deletePeriod = (periodName: string) => {
   const periods = getPeriods().filter(p => p.period !== periodName);
   setItem(STORAGE_KEYS.PERIODS, periods);
 };
+
+export const deleteAttendanceRecord = (timestamp: string) => {
+  const attendance = getAttendance().filter(a => a.timestamp !== timestamp);
+  setItem(STORAGE_KEYS.ATTENDANCE, attendance);
+};

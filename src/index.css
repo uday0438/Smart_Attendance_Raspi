@@ -1,5 +1,30 @@
 @import "tailwindcss";
 
+body {
+  margin: 0;
+  padding: 0;
+  background-image: linear-gradient(rgba(0,0,0,0.8), rgba(0,0,0,0.8)), url('/background.png');
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+  background-repeat: no-repeat;
+  min-height: 100vh;
+  background-color: #000;
+  color: #fff;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Glassmorphism for containers */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
 @keyframes scan {
   0%, 100% { top: 0%; }
   50% { top: calc(100% - 4px); }

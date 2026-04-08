@@ -21,6 +21,7 @@ export default defineConfig(({mode}) => {
           target: 'http://localhost:5000',
           changeOrigin: true,
           secure: false,
+          timeout: 30000,
         },
       },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.

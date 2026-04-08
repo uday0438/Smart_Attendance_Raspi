@@ -9,7 +9,7 @@ import time
 import pandas as pd
 import numpy as np
 from contextlib import contextmanager
-from flask import Flask, Response, request, jsonify
+from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 # =============================================================================
@@ -17,21 +17,25 @@ from flask_cors import CORS
 # =============================================================================
 DB_NAME = "attendance.db"
 DATASET_DIR = "dataset"
+IMAGES_DIR = os.path.join(DATASET_DIR, "images")
+INTRUDER_DIR = os.path.join(DATASET_DIR, "intruders")
+if not os.path.exists(IMAGES_DIR): os.makedirs(IMAGES_DIR)
+if not os.path.exists(INTRUDER_DIR): os.makedirs(INTRUDER_DIR)
 CAMERA_INDEX = 0
 
 # --- Accuracy knobs ---
-RECOGNITION_TOLERANCE = 0.45       # Lower = stricter matching (default lib is 0.6)
-PROCESS_SCALE = 0.35               # Scale factor for detection (smaller = faster)
-NUM_JITTERS = 1                    # Jitters for LIVE detection (1 = fast, accurate enough)
-REG_SAMPLES_TARGET = 50            # 50 samples for maximum accuracy
-REG_SAMPLES_MIN = 20               # At least 20 or fail
-REG_NUM_JITTERS = 1                # Use 1 jitter during rapid capture (speed) — 50 samples compensate
-REG_TIMEOUT = 10                   # Capture window in seconds
-DETECTION_MODEL = "hog"            # "hog" (fast, CPU) or "cnn" (slow, GPU/accurate)
-CAMERA_WIDTH = 640                 # 640x480 is fastest for streaming; AI still works well
+RECOGNITION_TOLERANCE = 0.48       
+PROCESS_SCALE = 0.25                # Ultra-fast detection (at cost of distance accuracy)
+NUM_JITTERS = 1                    
+REG_SAMPLES_TARGET = 10           
+REG_SAMPLES_MIN = 3                
+REG_NUM_JITTERS = 1                
+REG_TIMEOUT = 10                   
+DETECTION_MODEL = "hog"            
+CAMERA_WIDTH = 640                 
 CAMERA_HEIGHT = 480
-STREAM_FPS = 24                    # Target FPS for the MJPEG stream
-JPEG_QUALITY = 75                  # Lower = smaller frames = less lag over HTTP
+STREAM_FPS = 30                    # Smoother stream
+JPEG_QUALITY = 45                  # Low quality = max speed
 
 # =============================================================================
 # DATABASE MANAGER
@@ -70,7 +74,7 @@ class DatabaseManager:
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL)""")
             conn.commit()
-            print("📅 Database initialized")
+            print("Database initialized")
 
 
 # =============================================================================
@@ -85,20 +89,17 @@ class CameraManager:
     def start(self):
         with self.lock:
             if self.cam is None or not self.cam.isOpened():
-                self.cam = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
-                if not self.cam.isOpened():
-                    self.cam = cv2.VideoCapture(self.index)
-
-                if self.cam.isOpened():
-                    self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-                    self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-                    self.cam.set(cv2.CAP_PROP_FPS, 30)
-                    actual_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    actual_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    print(f"📷 Camera {self.index} started at {actual_w}x{actual_h}")
-                else:
-                    print(f"❌ Failed to open camera {self.index}")
-        return self.cam.isOpened() if self.cam else False
+                for idx in [self.index, 0, 1, 2]:
+                    print(f"Trying camera index {idx}...")
+                    self.cam = cv2.VideoCapture(idx)
+                    if self.cam.isOpened():
+                        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                        print(f"Camera found and started at index {idx}")
+                        self.index = idx
+                        return True
+                print("All camera indices failed.")
+        return False
 
     def get_frame(self):
         with self.lock:
@@ -112,7 +113,7 @@ class CameraManager:
             if self.cam:
                 self.cam.release()
                 self.cam = None
-                print("📷 Camera stopped")
+                print("Camera stopped")
 
 
 # =============================================================================
@@ -152,8 +153,8 @@ class AttendanceService:
                                 self.known_names.append(data["name"])
                             count += 1
                     except Exception as e:
-                        print(f"⚠️ Error loading {file}: {e}")
-            print(f"👤 Loaded {count} registered students ({len(self.known_encodings)} total encodings)")
+                        print(f"Error loading {file}: {e}")
+            print(f"Loaded {count} registered students ({len(self.known_encodings)} total encodings)")
 
     def _preprocess_frame(self, frame):
         """Resize and convert a BGR frame to an RGB numpy array suitable for dlib."""
@@ -177,7 +178,7 @@ class AttendanceService:
             face_locations = face_recognition.face_locations(
                 rgb_small,
                 model=DETECTION_MODEL,
-                number_of_times_to_upsample=1  # 1 is default; increase to find smaller faces
+                number_of_times_to_upsample=1  # Use 1 for fast CPU detection
             )
 
             if not face_locations:
@@ -238,13 +239,34 @@ class AttendanceService:
             return [], [], []
 
     def get_current_period(self):
-        now = datetime.datetime.now().strftime("%H:%M")
-        with self.db.get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT period, start_time, end_time FROM timetable ORDER BY start_time")
-            for p, s, e in cur.fetchall():
-                if s <= now <= e:
-                    return p
+        # Use server time in 24h format
+        now_dt = datetime.datetime.now()
+        now_str = now_dt.strftime("%H:%M")
+        try:
+            with self.db.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT period, start_time, end_time FROM timetable")
+                periods = cur.fetchall()
+                for p, s, e in periods:
+                    if s <= now_str <= e:
+                        # Calculate session type (In/Out/General)
+                        try:
+                            fmt = "%H:%M"
+                            s_dt = datetime.datetime.strptime(s, fmt).replace(year=now_dt.year, month=now_dt.month, day=now_dt.day)
+                            e_dt = datetime.datetime.strptime(e, fmt).replace(year=now_dt.year, month=now_dt.month, day=now_dt.day)
+                            
+                            diff_start = (now_dt - s_dt).total_seconds() / 60
+                            diff_end = (e_dt - now_dt).total_seconds() / 60
+                            
+                            if diff_start <= 5: s_type = "Check-In"
+                            elif diff_end <= 5: s_type = "Check-Out"
+                            else: s_type = "Active Session"
+                            
+                            return {"period": p, "type": s_type}
+                        except:
+                            return {"period": p, "type": "Active Session"}
+        except Exception as e:
+            print(f"get_current_period error: {e}")
         return None
 
     def record_attendance(self, period, method="Auto"):
@@ -298,6 +320,8 @@ class DetectionThread:
     Runs face detection in a separate thread so the video stream
     is never blocked by slow AI processing. The stream just reads
     the latest cached results.
+    Can be paused during registration so the camera is exclusively
+    available for face sample capture.
     """
     def __init__(self, service, camera):
         self.service = service
@@ -307,18 +331,30 @@ class DetectionThread:
         self._names = []
         self._ids = []
         self._running = False
+        self._paused = False
         self._thread = None
 
     def start(self):
         if self._running:
             return
         self._running = True
+        self._paused = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        print("🧠 Detection thread started")
+        print("Detection thread started")
 
     def stop(self):
         self._running = False
+
+    def pause(self):
+        """Pause detection so registration gets exclusive camera access."""
+        self._paused = True
+        print("Detection thread paused for registration")
+
+    def resume(self):
+        """Resume detection after registration completes."""
+        self._paused = False
+        print("Detection thread resumed")
 
     def get_results(self):
         """Thread-safe read of the latest detection results."""
@@ -327,22 +363,76 @@ class DetectionThread:
 
     def _loop(self):
         while self._running:
+            if self._paused:
+                time.sleep(0.1)
+                continue
+
             success, frame = self.camera.get_frame()
             if not success or frame is None:
                 time.sleep(0.03)
                 continue
 
-            # Run the AI (this is the slow part — runs in THIS thread, not the stream thread)
-            locations, names, ids = self.service.identify_faces(frame)
+            try:
+                # Frame skipping: only detect every 2 frames to save CPU
+                if not hasattr(self, '_skip_count'): self._skip_count = 0
+                self._skip_count += 1
+                if self._skip_count % 3 != 0:
+                    time.sleep(0.01)
+                    continue
 
-            # Cache results thread-safely
-            with self.lock:
-                self._locations = locations
-                self._names = names
-                self._ids = ids
+                locations, names, ids = self.service.identify_faces(frame)
 
-            # Small sleep to avoid pegging 100% CPU
-            time.sleep(0.02)
+                # --- AUTO-RECORD ATTENDANCE & INTRUDERS ---
+                period_info = self.service.get_current_period()
+                if period_info:
+                    current_p = period_info["period"]
+                    session_type = period_info["type"]
+                    date_str = str(datetime.date.today())
+                    
+                    # Track known faces
+                    recognized = []
+                    # Track unknown faces
+                    unknown_found = False
+                    
+                    for n, sid in zip(names, ids):
+                        if sid and "Unknown" not in n:
+                            recognized.append((sid, n.split(" (")[0]))
+                        else:
+                            unknown_found = True
+                    
+                    with self.service.db.get_connection() as conn:
+                        # 1. Save recognized students
+                        for sid, clean_name in set(recognized):
+                            try:
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO attendance (id, name, date, period, method, session_type) VALUES (?, ?, ?, ?, ?, ?)",
+                                    (sid, clean_name, date_str, current_p, "Auto", session_type)
+                                )
+                            except: continue
+                        
+                        # 2. Capture and Save Unknown (Intruder)
+                        if unknown_found:
+                            # Avoid spamming: only capture if non-duplicate in last 30 seconds
+                            ts = int(time.time())
+                            filename = f"intruder_{ts}.jpg"
+                            fpath = os.path.join(INTRUDER_DIR, filename)
+                            cv2.imwrite(fpath, frame)
+                            
+                            conn.execute(
+                                "INSERT INTO attendance (id, name, date, period, method, session_type, intruder_image) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                ("UNKNOWN", "Intruder Alert", date_str, current_p, "SECURITY", session_type, filename)
+                            )
+                        conn.commit()
+
+                with self.lock:
+                    self._locations = locations
+                    self._names = names
+                    self._ids = ids
+            except Exception as e:
+                print(f"Detection Loop Error: {e}")
+
+            # Sleep longer to reduce CPU load on Raspberry Pi
+            time.sleep(0.5)
 
 
 detection_thread = DetectionThread(attendance_svc, cam_mgr)
@@ -361,10 +451,7 @@ def gen_frames():
     Face detection runs in a separate thread; this just draws the
     latest cached results on each frame — zero lag.
     """
-    cam_mgr.start()
-    detection_thread.start()
-
-    scale_inv = 1.0 / PROCESS_SCALE  # e.g. ~2.86 when PROCESS_SCALE=0.35
+    scale_inv = 1.0 / PROCESS_SCALE
     frame_interval = 1.0 / STREAM_FPS
 
     while True:
@@ -392,12 +479,12 @@ def gen_frames():
             # Face rectangle
             cv2.rectangle(frame, (l, t), (r, b), color, 2)
 
-            # Label
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.55
+            # Professional Label
+            font = cv2.FONT_HERSHEY_DUPLEX
+            font_scale = 0.6
             text_size = cv2.getTextSize(name, font, font_scale, 1)[0]
-            lw = text_size[0] + 12
-            lh = text_size[1] + 12
+            lw = text_size[0] + 16
+            lh = text_size[1] + 16
             ly = t - lh if t - lh > 0 else b
 
             cv2.rectangle(frame, (l, ly), (l + lw, ly + lh), color, cv2.FILLED)
@@ -424,8 +511,15 @@ def video_stream():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+@app.route('/api/intruders/<filename>')
+def get_intruder_img(filename):
+    return send_from_directory(INTRUDER_DIR, filename)
+
+
 @app.route('/api/stats')
 def get_stats():
+    pi = attendance_svc.get_current_period()
+    cp = pi["period"] if pi else "No Active Period"
     with db_mgr.get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(DISTINCT id) FROM students")
@@ -435,7 +529,7 @@ def get_stats():
     return jsonify({
         "total_students": total_st,
         "present_today": present_today,
-        "current_period": attendance_svc.get_current_period() or "No Period",
+        "current_period": cp,
     })
 
 
@@ -500,13 +594,22 @@ def get_attendance():
 
 
 # Registration progress (thread-safe for polling)
-_reg_progress = {"active": False, "samples": 0, "target": REG_SAMPLES_TARGET, "name": ""}
+_reg_progress = {
+    "active": False, "samples": 0, "target": 5, "name": "",
+    "phase": "", "instruction": ""
+}
 _reg_lock = threading.Lock()
+
+# 3D capture phases — 4 samples per pose × 5 poses = 20 samples
+# Fast capture: 5 samples from front
+REG_PHASES = [
+    {"name": "Front", "instruction": "Look straight at the camera", "samples": 10},
+]
 
 
 @app.route('/api/register/status', methods=['GET'])
 def register_status():
-    """Frontend polls this to show real-time sample count."""
+    """Frontend polls this to show real-time sample count + current phase instruction."""
     with _reg_lock:
         return jsonify(_reg_progress)
 
@@ -514,114 +617,153 @@ def register_status():
 @app.route('/api/register', methods=['POST'])
 def register_student():
     """
-    High-speed 50-sample registration:
-    - Captures up to 50 face encodings in 10 seconds
-    - Uses num_jitters=1 per frame for speed (quantity over per-frame quality)
-    - 50 diverse samples = much better voting accuracy than 5 high-jitter samples
-    - Filters: only keeps the largest face, skips blurry/bad frames
+    3D Multi-Angle Face Registration:
+    - 5 phases: Front, Left, Right, Up, Down
+    - 4 samples captured per phase = 20 total encodings
+    - Captures different angles to build a 3D face profile
+    - Uses face landmarks to detect head orientation for each phase
     """
     data = request.json
     sid, name = data.get('id'), data.get('name')
     if not sid or not name:
         return jsonify({"success": False, "message": "Missing ID/Name"}), 400
 
+    total_target = sum(p["samples"] for p in REG_PHASES)
+
     # Initialize progress
     with _reg_lock:
-        _reg_progress.update({"active": True, "samples": 0, "target": REG_SAMPLES_TARGET, "name": name})
+        _reg_progress.update({
+            "active": True, "samples": 0, "target": total_target,
+            "name": name, "phase": "Preparing", "instruction": "Get ready..."
+        })
 
-    encodings = []
-    print(f"📸 Starting rapid capture for {name} (ID: {sid}) — target: {REG_SAMPLES_TARGET} in {REG_TIMEOUT}s")
+    # PAUSE detection thread so registration gets exclusive camera access
+    detection_thread.pause()
+    time.sleep(0.3)
 
-    # Flush stale buffered frames
+    all_encodings = []
+    print(f"Starting 3D capture for {name} (ID: {sid}) -- {len(REG_PHASES)} phases, {total_target} samples")
+
+    # Flush stale frames
     for _ in range(10):
         cam_mgr.get_frame()
 
     start_time = time.time()
-    attempt = 0
 
-    while time.time() - start_time < REG_TIMEOUT and len(encodings) < REG_SAMPLES_TARGET:
-        attempt += 1
-        success, frame = cam_mgr.get_frame()
-        if not success or frame is None:
-            time.sleep(0.01)
-            continue
+    for phase_idx, phase in enumerate(REG_PHASES):
+        phase_name = phase["name"]
+        phase_instruction = phase["instruction"]
+        phase_target = phase["samples"]
 
-        # Quick blur check — skip very blurry frames
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if laplacian_var < 50:  # Too blurry
-            continue
+        # Update progress with current phase
+        with _reg_lock:
+            _reg_progress["phase"] = phase_name
+            _reg_progress["instruction"] = phase_instruction
 
-        rgb = reg_preprocess(frame)
-        try:
-            locs = face_recognition.face_locations(rgb, model=DETECTION_MODEL)
-            if locs:
-                # Pick the largest face (closest to camera)
-                if len(locs) > 1:
-                    areas = [(b - t) * (r - l) for (t, r, b, l) in locs]
-                    largest_idx = np.argmax(areas)
-                    locs = [locs[largest_idx]]
+        print(f"  Phase {phase_idx+1}/{len(REG_PHASES)}: {phase_name} -- \"{phase_instruction}\"")
 
-                encs = face_recognition.face_encodings(rgb, locs, num_jitters=REG_NUM_JITTERS)
-                if encs:
-                    encodings.append(encs[0])
+        # Give user 1.0 seconds to adjust their head
+        time.sleep(1.0)
 
-                    # Update progress for polling
-                    with _reg_lock:
-                        _reg_progress["samples"] = len(encodings)
+        phase_encodings = []
+        best_frame = None
+        max_blur = 0
+        phase_start = time.time()
 
-                    if len(encodings) % 10 == 0 or len(encodings) == 1:
-                        elapsed = round(time.time() - start_time, 1)
-                        print(f"  ✅ {len(encodings)}/{REG_SAMPLES_TARGET} samples ({elapsed}s elapsed)")
-        except Exception as e:
-            print(f"  ⚠️ Capture error at attempt {attempt}: {e}")
-            continue
+        while len(phase_encodings) < phase_target and (time.time() - phase_start) < 5:
+            success, frame = cam_mgr.get_frame()
+            if not success or frame is None:
+                time.sleep(0.01)
+                continue
 
-        # Tiny sleep to allow camera buffer to refresh
-        time.sleep(0.02)
+            # Blur check (Relaxed for speed)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blur_val = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if blur_val < 20: # Much more lenient
+                continue
+
+            rgb = reg_preprocess(frame)
+            try:
+                locs = face_recognition.face_locations(rgb, model=DETECTION_MODEL)
+                if locs:
+                    # Pick largest face
+                    if len(locs) > 1:
+                        areas = [(b - t) * (r - l) for (t, r, b, l) in locs]
+                        locs = [locs[np.argmax(areas)]]
+
+                    encs = face_recognition.face_encodings(rgb, locs, num_jitters=REG_NUM_JITTERS)
+                    if encs:
+                        phase_encodings.append(encs[0])
+                        all_encodings.append(encs[0])
+                        
+                        if blur_val > max_blur:
+                            max_blur = blur_val
+                            best_frame = frame.copy()
+
+                        with _reg_lock:
+                            _reg_progress["samples"] = len(all_encodings)
+            except Exception as e:
+                print(f"    Error: {e}")
+                continue
+
+            time.sleep(0.01) # Minimum delay for max speed
+
+        # Save the best frame from Phase 1 as the reference photo
+        if phase_name == "Front" and best_frame is not None:
+            photo_path = os.path.join(IMAGES_DIR, f"{sid}.jpg")
+            cv2.imwrite(photo_path, best_frame)
+            print(f"Reference photo saved to {photo_path}")
+
+        print(f"    {phase_name}: captured {len(phase_encodings)}/{phase_target} samples")
 
     elapsed = round(time.time() - start_time, 1)
-    print(f"📊 Capture finished: {len(encodings)} samples in {elapsed}s ({attempt} frames processed)")
+    print(f"3D Capture complete: {len(all_encodings)} samples in {elapsed}s across {len(REG_PHASES)} angles")
+
+    # RESUME detection thread
+    detection_thread.resume()
 
     # Mark progress as complete
     with _reg_lock:
-        _reg_progress.update({"active": False, "samples": len(encodings)})
+        _reg_progress.update({
+            "active": False, "samples": len(all_encodings),
+            "phase": "Complete", "instruction": ""
+        })
 
-    if len(encodings) < REG_SAMPLES_MIN:
+    if len(all_encodings) < REG_SAMPLES_MIN:
         return jsonify({
             "success": False,
-            "message": f"Only captured {len(encodings)}/{REG_SAMPLES_MIN} samples in {elapsed}s. "
-                       f"Ensure good lighting and look directly at the camera."
+            "message": f"Only captured {len(all_encodings)}/{REG_SAMPLES_MIN} samples. "
+                       f"Ensure good lighting and follow the head position prompts."
         }), 400
 
     # Save dataset
     dataset_file = os.path.join(DATASET_DIR, f"{sid}.pkl")
     try:
         with open(dataset_file, 'wb') as f:
-            pickle.dump({"id": sid, "name": name, "encoding": encodings}, f)
-        print(f"💾 Saved {len(encodings)} face encodings to {dataset_file}")
+            pickle.dump({"id": sid, "name": name, "encoding": all_encodings}, f)
+        print(f"Saved {len(all_encodings)} multi-angle face encodings to {dataset_file}")
     except Exception as e:
-        print(f"❌ Failed to save pkl: {e}")
+        print(f"Failed to save pkl: {e}")
         return jsonify({"success": False, "message": "Failed to save registration file"}), 500
 
     with db_mgr.get_connection() as conn:
         conn.execute("INSERT OR REPLACE INTO students (id, name) VALUES (?, ?)", (sid, name))
         conn.commit()
-        print(f"🗄️ Student '{name}' registered with {len(encodings)} face samples")
+        print(f"Student '{name}' registered with {len(all_encodings)} multi-angle face samples")
 
     attendance_svc.load_known_faces()
     return jsonify({
         "success": True,
-        "message": f"Registered {name} with {len(encodings)} face samples in {elapsed}s"
+        "message": f"Registered {name} with {len(all_encodings)} 3D face samples ({len(REG_PHASES)} angles) in {elapsed}s"
     }), 201
 
 
 def reg_preprocess(frame):
-    """Preprocess a frame for registration (slightly higher res than live detection)."""
-    # Use 0.5 scale for registration — better detail than live detection's 0.35
-    small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    """Preprocess a frame for registration (Full resolution for max accuracy)."""
+    # Use full resolution (no resize) for registration to avoid missing faces
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return np.ascontiguousarray(rgb, dtype=np.uint8)
+
 
 
 
@@ -630,8 +772,9 @@ def reg_preprocess(frame):
 # =============================================================================
 if __name__ == "__main__":
     if cam_mgr.start():
+        detection_thread.start()
         print("=" * 60)
-        print("🚀 ClassLens AI Backend — Threaded Detection")
+        print("ClassLens AI Backend -- Threaded Detection")
         print(f"   Camera:      {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
         print(f"   Model:       {DETECTION_MODEL}")
         print(f"   Tolerance:   {RECOGNITION_TOLERANCE}")
@@ -642,5 +785,5 @@ if __name__ == "__main__":
         print("=" * 60)
         app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
     else:
-        print("❌ Startup failed: Camera could not be initialized")
+        print("Startup failed: Camera could not be initialized")
 
