@@ -21,15 +21,16 @@ CAMERA_INDEX = 0
 
 # --- Accuracy knobs ---
 RECOGNITION_TOLERANCE = 0.45       # Lower = stricter matching (default lib is 0.6)
-PROCESS_SCALE = 0.5                # Scale factor for detection (0.5 = half res)
-NUM_JITTERS = 2                    # Re-sample each face N times during recognition (higher = more accurate, slower)
-REG_NUM_JITTERS = 10               # More jitters during registration for a richer encoding
+PROCESS_SCALE = 0.35               # Scale factor for detection (smaller = faster)
+NUM_JITTERS = 1                    # Jitters for LIVE detection (1 = fast, accurate enough)
+REG_NUM_JITTERS = 10               # High jitters during registration for rich encodings
 REG_SAMPLES_TARGET = 10            # How many face samples to capture during registration
 REG_SAMPLES_MIN = 5                # Minimum required or registration fails
 DETECTION_MODEL = "hog"            # "hog" (fast, CPU) or "cnn" (slow, GPU/accurate)
-FRAME_SKIP = 2                     # Process every Nth frame for perf (1 = every frame)
-CAMERA_WIDTH = 1280                # Higher res camera input = more detail for the AI
-CAMERA_HEIGHT = 720
+CAMERA_WIDTH = 640                 # 640x480 is fastest for streaming; AI still works well
+CAMERA_HEIGHT = 480
+STREAM_FPS = 24                    # Target FPS for the MJPEG stream
+JPEG_QUALITY = 75                  # Lower = smaller frames = less lag over HTTP
 
 # =============================================================================
 # DATABASE MANAGER
@@ -289,6 +290,64 @@ attendance_svc = AttendanceService(db_mgr, cam_mgr)
 
 
 # =============================================================================
+# BACKGROUND DETECTION THREAD — keeps video smooth
+# =============================================================================
+class DetectionThread:
+    """
+    Runs face detection in a separate thread so the video stream
+    is never blocked by slow AI processing. The stream just reads
+    the latest cached results.
+    """
+    def __init__(self, service, camera):
+        self.service = service
+        self.camera = camera
+        self.lock = threading.Lock()
+        self._locations = []
+        self._names = []
+        self._ids = []
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        print("🧠 Detection thread started")
+
+    def stop(self):
+        self._running = False
+
+    def get_results(self):
+        """Thread-safe read of the latest detection results."""
+        with self.lock:
+            return list(self._locations), list(self._names), list(self._ids)
+
+    def _loop(self):
+        while self._running:
+            success, frame = self.camera.get_frame()
+            if not success or frame is None:
+                time.sleep(0.03)
+                continue
+
+            # Run the AI (this is the slow part — runs in THIS thread, not the stream thread)
+            locations, names, ids = self.service.identify_faces(frame)
+
+            # Cache results thread-safely
+            with self.lock:
+                self._locations = locations
+                self._names = names
+                self._ids = ids
+
+            # Small sleep to avoid pegging 100% CPU
+            time.sleep(0.02)
+
+
+detection_thread = DetectionThread(attendance_svc, cam_mgr)
+
+
+# =============================================================================
 # FLASK APP
 # =============================================================================
 app = Flask(__name__)
@@ -296,61 +355,63 @@ CORS(app)
 
 
 def gen_frames():
-    """Generator that yields MJPEG frames with real-time face overlays."""
+    """
+    Generator that yields MJPEG frames at ~STREAM_FPS.
+    Face detection runs in a separate thread; this just draws the
+    latest cached results on each frame — zero lag.
+    """
     cam_mgr.start()
-    frame_count = 0
-    cached_locations = []
-    cached_names = []
-    scale_inv = int(1 / PROCESS_SCALE)  # e.g. 2 when PROCESS_SCALE=0.5
+    detection_thread.start()
+
+    scale_inv = 1.0 / PROCESS_SCALE  # e.g. ~2.86 when PROCESS_SCALE=0.35
+    frame_interval = 1.0 / STREAM_FPS
 
     while True:
+        t_start = time.time()
+
         success, frame = cam_mgr.get_frame()
         if not success:
-            time.sleep(0.05)
+            time.sleep(0.02)
             continue
 
-        frame_count += 1
+        # Read latest detection results (non-blocking)
+        locations, names, _ = detection_thread.get_results()
 
-        # Only run the expensive AI detection every Nth frame
-        if frame_count % FRAME_SKIP == 0:
-            locations, names, _ = attendance_svc.identify_faces(frame)
-            cached_locations = locations
-            cached_names = names
-
-        # Draw overlays using cached results
-        for (top, right, bottom, left), name in zip(cached_locations, cached_names):
-            # Scale back to original resolution
-            top *= scale_inv
-            right *= scale_inv
-            bottom *= scale_inv
-            left *= scale_inv
+        # Draw overlays
+        for (top, right, bottom, left), name in zip(locations, names):
+            # Scale back to original camera resolution
+            t = int(top * scale_inv)
+            r = int(right * scale_inv)
+            b = int(bottom * scale_inv)
+            l = int(left * scale_inv)
 
             is_known = "Unknown" not in name
             color = (0, 200, 0) if is_known else (0, 0, 220)
-            thickness = 2
 
-            # Rounded-corner effect: draw the main box
-            cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
+            # Face rectangle
+            cv2.rectangle(frame, (l, t), (r, b), color, 2)
 
-            # Label background with padding
-            label = name
+            # Label
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.55
-            text_size = cv2.getTextSize(label, font, font_scale, 1)[0]
-            label_w = text_size[0] + 12
-            label_h = text_size[1] + 12
+            text_size = cv2.getTextSize(name, font, font_scale, 1)[0]
+            lw = text_size[0] + 12
+            lh = text_size[1] + 12
+            ly = t - lh if t - lh > 0 else b
 
-            # Position label above the box (or below if at top of frame)
-            label_y_start = top - label_h if top - label_h > 0 else bottom
-            label_y_end = label_y_start + label_h
-
-            cv2.rectangle(frame, (left, label_y_start), (left + label_w, label_y_end), color, cv2.FILLED)
-            cv2.putText(frame, label, (left + 6, label_y_end - 6), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(frame, (l, ly), (l + lw, ly + lh), color, cv2.FILLED)
+            cv2.putText(frame, name, (l + 6, ly + lh - 6), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Encode and yield
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if ret:
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+        # Frame rate limiter
+        elapsed = time.time() - t_start
+        wait = frame_interval - elapsed
+        if wait > 0:
+            time.sleep(wait)
 
 
 # =============================================================================
@@ -526,15 +587,16 @@ def self_preprocess(frame):
 if __name__ == "__main__":
     if cam_mgr.start():
         print("=" * 60)
-        print("🚀 ClassLens AI Backend Running")
-        print(f"   Camera:     {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-        print(f"   Model:      {DETECTION_MODEL}")
-        print(f"   Tolerance:  {RECOGNITION_TOLERANCE}")
-        print(f"   Jitters:    {NUM_JITTERS} (recognition) / {REG_NUM_JITTERS} (registration)")
-        print(f"   Scale:      {PROCESS_SCALE}")
-        print(f"   Frame Skip: {FRAME_SKIP}")
-        print(f"   Server:     http://localhost:5000")
+        print("🚀 ClassLens AI Backend — Threaded Detection")
+        print(f"   Camera:      {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+        print(f"   Model:       {DETECTION_MODEL}")
+        print(f"   Tolerance:   {RECOGNITION_TOLERANCE}")
+        print(f"   Scale:       {PROCESS_SCALE} ({int(CAMERA_WIDTH*PROCESS_SCALE)}x{int(CAMERA_HEIGHT*PROCESS_SCALE)} detection)")
+        print(f"   Stream FPS:  {STREAM_FPS}")
+        print(f"   Architecture: Background thread (zero-lag overlay)")
+        print(f"   Server:      http://localhost:5000")
         print("=" * 60)
         app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
     else:
         print("❌ Startup failed: Camera could not be initialized")
+
