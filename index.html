@@ -3,26 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My Google AI Studio App</title>
-    <script>
-      // Prevent "Cannot set property fetch of #<Window> which has only a getter"
-      // This happens because react-router v7 tries to polyfill fetch.
-      try {
-        const originalFetch = window.fetch;
-        Object.defineProperty(window, 'fetch', {
-          configurable: true,
-          enumerable: true,
-          get() {
-            return originalFetch;
-          },
-          set(value) {
-            console.warn('Ignored attempt to overwrite window.fetch');
-          }
-        });
-      } catch (e) {
-        console.error('Failed to protect window.fetch:', e);
-      }
-    </script>
+    <title>ClassLens - AI Attendance System</title>
   </head>
   <body>
     <div id="root"></div>

@@ -12,15 +12,28 @@ from contextlib import contextmanager
 from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 
-# Configuration
+# =============================================================================
+# CONFIGURATION — tune these for your environment
+# =============================================================================
 DB_NAME = "attendance.db"
 DATASET_DIR = "dataset"
 CAMERA_INDEX = 0
 
-# ============================================================================
-# MANAGERS (OOP REFACTOR)
-# ============================================================================
+# --- Accuracy knobs ---
+RECOGNITION_TOLERANCE = 0.45       # Lower = stricter matching (default lib is 0.6)
+PROCESS_SCALE = 0.5                # Scale factor for detection (0.5 = half res)
+NUM_JITTERS = 2                    # Re-sample each face N times during recognition (higher = more accurate, slower)
+REG_NUM_JITTERS = 10               # More jitters during registration for a richer encoding
+REG_SAMPLES_TARGET = 10            # How many face samples to capture during registration
+REG_SAMPLES_MIN = 5                # Minimum required or registration fails
+DETECTION_MODEL = "hog"            # "hog" (fast, CPU) or "cnn" (slow, GPU/accurate)
+FRAME_SKIP = 2                     # Process every Nth frame for perf (1 = every frame)
+CAMERA_WIDTH = 1280                # Higher res camera input = more detail for the AI
+CAMERA_HEIGHT = 720
 
+# =============================================================================
+# DATABASE MANAGER
+# =============================================================================
 class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -38,7 +51,7 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cur = conn.cursor()
             cur.execute("""CREATE TABLE IF NOT EXISTS students(
-                id TEXT PRIMARY KEY, 
+                id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 registered_date TEXT DEFAULT CURRENT_TIMESTAMP)""")
             cur.execute("""CREATE TABLE IF NOT EXISTS attendance(
@@ -55,8 +68,12 @@ class DatabaseManager:
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL)""")
             conn.commit()
-            print("📅 Database Managed & Initialized")
+            print("📅 Database initialized")
 
+
+# =============================================================================
+# CAMERA MANAGER — higher resolution for better face detail
+# =============================================================================
 class CameraManager:
     def __init__(self, index=0):
         self.index = index
@@ -66,15 +83,17 @@ class CameraManager:
     def start(self):
         with self.lock:
             if self.cam is None or not self.cam.isOpened():
-                # On Windows, cv2.CAP_DSHOW often prevents blank/failed reads
                 self.cam = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
                 if not self.cam.isOpened():
-                    self.cam = cv2.VideoCapture(self.index) # fallback
+                    self.cam = cv2.VideoCapture(self.index)
 
                 if self.cam.isOpened():
-                    self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    print(f"📷 Camera {self.index} started")
+                    self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                    self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                    self.cam.set(cv2.CAP_PROP_FPS, 30)
+                    actual_w = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_h = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    print(f"📷 Camera {self.index} started at {actual_w}x{actual_h}")
                 else:
                     print(f"❌ Failed to open camera {self.index}")
         return self.cam.isOpened() if self.cam else False
@@ -83,11 +102,8 @@ class CameraManager:
         with self.lock:
             if self.cam and self.cam.isOpened():
                 success, frame = self.cam.read()
-                if not success:
-                    print("⚠️ get_frame: self.cam.read() returned False")
                 return success, frame
         return False, None
-
 
     def stop(self):
         with self.lock:
@@ -96,6 +112,10 @@ class CameraManager:
                 self.cam = None
                 print("📷 Camera stopped")
 
+
+# =============================================================================
+# ATTENDANCE SERVICE — high-accuracy multi-face engine
+# =============================================================================
 class AttendanceService:
     def __init__(self, db_manager, camera_manager):
         self.db = db_manager
@@ -103,59 +123,117 @@ class AttendanceService:
         self.known_encodings = []
         self.known_ids = []
         self.known_names = []
+        self._lock = threading.Lock()
+        # Cached results for the video overlay (avoid re-computing every frame)
+        self._cached_locations = []
+        self._cached_names = []
+        self._cached_ids = []
+        self._frame_count = 0
         self.load_known_faces()
 
     def load_known_faces(self):
-        self.known_encodings, self.known_ids, self.known_names = [], [], []
-        if not os.path.exists(DATASET_DIR):
-            os.makedirs(DATASET_DIR)
-        
-        count = 0
-        for file in os.listdir(DATASET_DIR):
-            if file.endswith('.pkl'):
-                try:
-                    with open(os.path.join(DATASET_DIR, file), 'rb') as f:
-                        data = pickle.load(f)
-                        for enc in data["encoding"]:
-                            self.known_encodings.append(enc)
-                            self.known_ids.append(data["id"])
-                            self.known_names.append(data["name"])
-                        count += 1
-                except Exception as e:
-                    print(f"⚠️ Error loading {file}: {e}")
-        print(f"👤 Loaded {count} registered students.")
+        """Load all registered face encodings from disk."""
+        with self._lock:
+            self.known_encodings, self.known_ids, self.known_names = [], [], []
+            if not os.path.exists(DATASET_DIR):
+                os.makedirs(DATASET_DIR)
+
+            count = 0
+            for file in os.listdir(DATASET_DIR):
+                if file.endswith('.pkl'):
+                    try:
+                        with open(os.path.join(DATASET_DIR, file), 'rb') as f:
+                            data = pickle.load(f)
+                            for enc in data["encoding"]:
+                                self.known_encodings.append(enc)
+                                self.known_ids.append(data["id"])
+                                self.known_names.append(data["name"])
+                            count += 1
+                    except Exception as e:
+                        print(f"⚠️ Error loading {file}: {e}")
+            print(f"👤 Loaded {count} registered students ({len(self.known_encodings)} total encodings)")
+
+    def _preprocess_frame(self, frame):
+        """Resize and convert a BGR frame to an RGB numpy array suitable for dlib."""
+        small = cv2.resize(frame, (0, 0), fx=PROCESS_SCALE, fy=PROCESS_SCALE)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        # Ensure contiguous uint8 array (dlib requirement)
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
 
     def identify_faces(self, frame):
+        """
+        Detect ALL faces in the frame and return their locations + names.
+        Uses a voting/distance strategy for better accuracy with multiple encodings.
+        """
         if frame is None or frame.size == 0:
-            return [], []
+            return [], [], []
 
         try:
-            # Resize for performance (0.5 is a good balance between speed and accuracy)
-            small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-            # face_recognition requires 8-bit gray or RGB image
-            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            # Force perfectly contiguous exact array for dlib
-            rgb_small_frame = np.array(rgb_small_frame[:, :, :3], dtype=np.uint8, copy=True)
-            
-            face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
-            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+            rgb_small = self._preprocess_frame(frame)
+
+            # Detect every face in the frame
+            face_locations = face_recognition.face_locations(
+                rgb_small,
+                model=DETECTION_MODEL,
+                number_of_times_to_upsample=1  # 1 is default; increase to find smaller faces
+            )
+
+            if not face_locations:
+                return [], [], []
+
+            # Generate 128-d encodings with extra jitters for accuracy
+            face_encodings = face_recognition.face_encodings(
+                rgb_small,
+                face_locations,
+                num_jitters=NUM_JITTERS
+            )
 
             face_names = []
-            for face_encoding in face_encodings:
-                name = "Unknown"
-                if len(self.known_encodings) > 0:
-                    matches = face_recognition.compare_faces(self.known_encodings, face_encoding, tolerance=0.5)
-                    if True in matches:
-                        face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
-                        best_match_idx = np.argmin(face_distances)
-                        if matches[best_match_idx]:
-                            name = self.known_names[best_match_idx]
-                face_names.append(name)
-            
-            return face_locations, face_names
+            face_ids = []
+
+            with self._lock:
+                for face_encoding in face_encodings:
+                    name = "Unknown"
+                    sid = None
+
+                    if len(self.known_encodings) > 0:
+                        # Compute distances to every known encoding
+                        distances = face_recognition.face_distance(self.known_encodings, face_encoding)
+
+                        # --- Voting strategy for multi-sample accuracy ---
+                        # Group distances by student ID to find the best overall match
+                        id_scores = {}  # id -> list of distances that are under tolerance
+                        for idx, dist in enumerate(distances):
+                            if dist <= RECOGNITION_TOLERANCE:
+                                kid = self.known_ids[idx]
+                                if kid not in id_scores:
+                                    id_scores[kid] = []
+                                id_scores[kid].append(dist)
+
+                        if id_scores:
+                            # Pick the student with the most under-tolerance matches,
+                            # breaking ties by lowest average distance
+                            best_id = max(
+                                id_scores.keys(),
+                                key=lambda k: (len(id_scores[k]), -np.mean(id_scores[k]))
+                            )
+                            sid = best_id
+                            # Find the name from known lists
+                            name_idx = self.known_ids.index(best_id)
+                            name = self.known_names[name_idx]
+                            avg_dist = np.mean(id_scores[best_id])
+                            confidence = round((1 - avg_dist) * 100)
+                            name = f"{name} ({confidence}%)"
+
+                    face_names.append(name)
+                    face_ids.append(sid)
+
+            return face_locations, face_names, face_ids
+
         except Exception as e:
             print(f"⚠️ identify_faces error: {e}")
-            return [], []
+            import traceback; traceback.print_exc()
+            return [], [], []
 
     def get_current_period(self):
         now = datetime.datetime.now().strftime("%H:%M")
@@ -168,73 +246,121 @@ class AttendanceService:
         return None
 
     def record_attendance(self, period, method="Auto"):
+        """Capture one frame, detect all faces, mark them present."""
         ret, frame = self.camera.get_frame()
-        if not ret or frame is None: return "Camera Error"
+        if not ret or frame is None:
+            return "Camera Error"
 
-        locations, names = self.identify_faces(frame)
-        recognized = [name for name in set(names) if name != "Unknown"]
-        
-        if not recognized: return "No recognized faces"
+        locations, names, ids = self.identify_faces(frame)
+        recognized_pairs = []
+        for name, sid in zip(names, ids):
+            if sid is not None and "Unknown" not in name:
+                # Strip confidence suffix for DB storage
+                clean_name = name.split(" (")[0]
+                recognized_pairs.append((sid, clean_name))
+
+        if not recognized_pairs:
+            return "No recognized faces"
 
         date = str(datetime.date.today())
         count = 0
         with self.db.get_connection() as conn:
             cur = conn.cursor()
-            for name in recognized:
-                # Find ID for this name from known lists
-                idx = self.known_names.index(name)
-                sid = self.known_ids[idx]
+            for sid, clean_name in set(recognized_pairs):
                 try:
                     cur.execute(
                         "INSERT OR IGNORE INTO attendance (id, name, date, period, method) VALUES (?, ?, ?, ?, ?)",
-                        (sid, name, date, period, method)
+                        (sid, clean_name, date, period, method)
                     )
-                    if cur.rowcount > 0: count += 1
-                except: continue
+                    if cur.rowcount > 0:
+                        count += 1
+                except:
+                    continue
             conn.commit()
         return f"Marked {count} students present"
 
-# initialize global state
+
+# =============================================================================
+# INITIALIZE
+# =============================================================================
 db_mgr = DatabaseManager(DB_NAME)
 cam_mgr = CameraManager(CAMERA_INDEX)
 attendance_svc = AttendanceService(db_mgr, cam_mgr)
 
-# ============================================================================
-# FLASK APP
-# ============================================================================
 
+# =============================================================================
+# FLASK APP
+# =============================================================================
 app = Flask(__name__)
 CORS(app)
 
+
 def gen_frames():
+    """Generator that yields MJPEG frames with real-time face overlays."""
     cam_mgr.start()
+    frame_count = 0
+    cached_locations = []
+    cached_names = []
+    scale_inv = int(1 / PROCESS_SCALE)  # e.g. 2 when PROCESS_SCALE=0.5
+
     while True:
         success, frame = cam_mgr.get_frame()
         if not success:
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
-        
-        # Advanced Feature: Bounding Box Overlay
-        locations, names = attendance_svc.identify_faces(frame)
-        for (top, right, bottom, left), name in zip(locations, names):
-            # Scale back up (since we resized to 0.5, multiply by 2)
-            top, right, bottom, left = top*2, right*2, bottom*2, left*2
-            color = (0, 255, 0) if name != "Unknown" else (0, 0, 255) # Green: Known, Red: Unknown
-            
-            # Box
-            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            # Label background
-            cv2.rectangle(frame, (left, bottom - 30), (right, bottom), color, cv2.FILLED)
-            # Name tag
-            cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
 
-        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        frame_count += 1
 
+        # Only run the expensive AI detection every Nth frame
+        if frame_count % FRAME_SKIP == 0:
+            locations, names, _ = attendance_svc.identify_faces(frame)
+            cached_locations = locations
+            cached_names = names
+
+        # Draw overlays using cached results
+        for (top, right, bottom, left), name in zip(cached_locations, cached_names):
+            # Scale back to original resolution
+            top *= scale_inv
+            right *= scale_inv
+            bottom *= scale_inv
+            left *= scale_inv
+
+            is_known = "Unknown" not in name
+            color = (0, 200, 0) if is_known else (0, 0, 220)
+            thickness = 2
+
+            # Rounded-corner effect: draw the main box
+            cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
+
+            # Label background with padding
+            label = name
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.55
+            text_size = cv2.getTextSize(label, font, font_scale, 1)[0]
+            label_w = text_size[0] + 12
+            label_h = text_size[1] + 12
+
+            # Position label above the box (or below if at top of frame)
+            label_y_start = top - label_h if top - label_h > 0 else bottom
+            label_y_end = label_y_start + label_h
+
+            cv2.rectangle(frame, (left, label_y_start), (left + label_w, label_y_end), color, cv2.FILLED)
+            cv2.putText(frame, label, (left + 6, label_y_end - 6), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Encode and yield
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if ret:
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+
+# =============================================================================
 # API ENDPOINTS
+# =============================================================================
+
 @app.route('/api/video')
 def video_stream():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 @app.route('/api/stats')
 def get_stats():
@@ -248,8 +374,8 @@ def get_stats():
         "total_students": total_st,
         "present_today": present_today,
         "current_period": attendance_svc.get_current_period() or "No Period",
-        "gpio_enabled": False
     })
+
 
 @app.route('/api/students', methods=['GET'])
 def list_students():
@@ -257,30 +383,35 @@ def list_students():
         df = pd.read_sql_query("SELECT id, name, registered_date FROM students", conn)
     return jsonify(df.to_dict('records'))
 
+
 @app.route('/api/students/<student_id>', methods=['DELETE'])
 def delete_student(student_id):
     with db_mgr.get_connection() as conn:
         conn.execute("DELETE FROM students WHERE id=?", (student_id,))
         conn.execute("DELETE FROM attendance WHERE id=?", (student_id,))
         conn.commit()
-    # Cleanup file
     fpath = os.path.join(DATASET_DIR, f"{student_id}.pkl")
-    if os.path.exists(fpath): os.remove(fpath)
+    if os.path.exists(fpath):
+        os.remove(fpath)
     attendance_svc.load_known_faces()
     return jsonify({"status": "success"}), 204
+
 
 @app.route('/api/timetable', methods=['GET', 'POST'])
 def timetable():
     if request.method == 'POST':
         data = request.json
         with db_mgr.get_connection() as conn:
-            conn.execute("INSERT OR REPLACE INTO timetable (period, start_time, end_time) VALUES (?, ?, ?)",
-                         (data['period'], data['start_time'], data['end_time']))
+            conn.execute(
+                "INSERT OR REPLACE INTO timetable (period, start_time, end_time) VALUES (?, ?, ?)",
+                (data['period'], data['start_time'], data['end_time'])
+            )
             conn.commit()
         return jsonify({"status": "success"}), 201
     with db_mgr.get_connection() as conn:
         df = pd.read_sql_query("SELECT * FROM timetable", conn)
     return jsonify(df.to_dict('records'))
+
 
 @app.route('/api/timetable/<period>', methods=['DELETE'])
 def delete_period(period):
@@ -288,6 +419,7 @@ def delete_period(period):
         conn.execute("DELETE FROM timetable WHERE period=?", (period,))
         conn.commit()
     return jsonify({"status": "success"}), 204
+
 
 @app.route('/api/trigger', methods=['POST'])
 def trigger():
@@ -297,75 +429,112 @@ def trigger():
     msg = attendance_svc.record_attendance(period, method="Manual")
     return jsonify({"status": "success", "message": msg})
 
+
 @app.route('/api/attendance', methods=['GET'])
 def get_attendance():
     with db_mgr.get_connection() as conn:
         df = pd.read_sql_query("SELECT * FROM attendance ORDER BY timestamp DESC LIMIT 100", conn)
     return jsonify(df.to_dict('records'))
 
+
 @app.route('/api/register', methods=['POST'])
 def register_student():
+    """
+    High-accuracy registration:
+    - Captures multiple face samples from the camera
+    - Uses high num_jitters for rich 128-d encodings
+    - Stores all samples in a .pkl file for voting-based matching
+    """
     data = request.json
     sid, name = data.get('id'), data.get('name')
-    if not sid or not name: return jsonify({"success": False, "message": "Missing ID/Name"}), 400
-    
-    # Capture loop
+    if not sid or not name:
+        return jsonify({"success": False, "message": "Missing ID/Name"}), 400
+
     encodings = []
-    print(f"📸 Starting capture for {name} (ID: {sid})")
-    
-    # Flush stale frames
-    for _ in range(5): cam_mgr.get_frame()
-    
-    for i in range(15): # Increased to 15 attempts
-        time.sleep(0.1)
+    print(f"📸 Starting high-accuracy capture for {name} (ID: {sid})")
+
+    # Flush stale buffered frames
+    for _ in range(8):
+        cam_mgr.get_frame()
+
+    for i in range(25):  # More attempts to ensure enough samples
+        time.sleep(0.15)
         success, frame = cam_mgr.get_frame()
-        if success and frame is not None:
-            # Scale down slightly for performance and noise reduction
-            small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-            rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            rgb = np.array(rgb[:, :, :3], dtype=np.uint8, copy=True)
-            try:
-                # Use faster 'hog' model
-                locs = face_recognition.face_locations(rgb, model="hog")
-                if locs:
-                    encs = face_recognition.face_encodings(rgb, locs)
-                    if encs: 
-                        encodings.append(encs[0])
-                        print(f"✅ Sample {len(encodings)}/15 captured")
-                else:
-                    print(f"◽ Loop {i+1}: No face seen")
-            except Exception as e:
-                print(f"⚠️ capture error at loop {i+1}: {e}")
-        
-        if len(encodings) >= 5: break # Finish early if we have enough
-    
-    print(f"📊 Capture finished. Total faces found: {len(encodings)}")
-    
-    if len(encodings) < 3:
-        return jsonify({"success": False, "message": f"Could only find {len(encodings)} samples. Look directly at camera."}), 400
-        
+        if not success or frame is None:
+            continue
+
+        rgb = self_preprocess(frame)
+        try:
+            locs = face_recognition.face_locations(rgb, model=DETECTION_MODEL)
+            if locs:
+                # Use only the largest face (closest to camera) for registration
+                if len(locs) > 1:
+                    areas = [(b - t) * (r - l) for (t, r, b, l) in locs]
+                    largest_idx = np.argmax(areas)
+                    locs = [locs[largest_idx]]
+
+                encs = face_recognition.face_encodings(rgb, locs, num_jitters=REG_NUM_JITTERS)
+                if encs:
+                    encodings.append(encs[0])
+                    print(f"  ✅ Sample {len(encodings)}/{REG_SAMPLES_TARGET} captured")
+            else:
+                print(f"  ◽ Attempt {i+1}: No face visible")
+        except Exception as e:
+            print(f"  ⚠️ Capture error at attempt {i+1}: {e}")
+
+        if len(encodings) >= REG_SAMPLES_TARGET:
+            break
+
+    print(f"📊 Capture finished. Total samples: {len(encodings)}")
+
+    if len(encodings) < REG_SAMPLES_MIN:
+        return jsonify({
+            "success": False,
+            "message": f"Only captured {len(encodings)}/{REG_SAMPLES_MIN} face samples. "
+                       f"Please look directly at the camera and ensure good lighting."
+        }), 400
+
     # Save dataset
     dataset_file = os.path.join(DATASET_DIR, f"{sid}.pkl")
     try:
         with open(dataset_file, 'wb') as f:
             pickle.dump({"id": sid, "name": name, "encoding": encodings}, f)
-            print(f"💾 Saved face data to {dataset_file}")
+        print(f"💾 Saved {len(encodings)} face encodings to {dataset_file}")
     except Exception as e:
         print(f"❌ Failed to save pkl: {e}")
         return jsonify({"success": False, "message": "Failed to save registration file"}), 500
-        
-    # Use the global db_mgr
+
     with db_mgr.get_connection() as conn:
         conn.execute("INSERT OR REPLACE INTO students (id, name) VALUES (?, ?)", (sid, name))
         conn.commit()
         print(f"🗄️ Database entry created for {name}")
-        
-    attendance_svc.load_known_faces()
-    return jsonify({"success": True, "message": f"Successfully Registered {name}"}), 201
 
+    attendance_svc.load_known_faces()
+    return jsonify({"success": True, "message": f"Successfully registered {name} with {len(encodings)} face samples"}), 201
+
+
+def self_preprocess(frame):
+    """Preprocess a frame for face_recognition (used during registration)."""
+    small = cv2.resize(frame, (0, 0), fx=PROCESS_SCALE, fy=PROCESS_SCALE)
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 if __name__ == "__main__":
     if cam_mgr.start():
-        print("🚀 Professional Attendance Backend Running on http://localhost:5000")
+        print("=" * 60)
+        print("🚀 ClassLens AI Backend Running")
+        print(f"   Camera:     {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+        print(f"   Model:      {DETECTION_MODEL}")
+        print(f"   Tolerance:  {RECOGNITION_TOLERANCE}")
+        print(f"   Jitters:    {NUM_JITTERS} (recognition) / {REG_NUM_JITTERS} (registration)")
+        print(f"   Scale:      {PROCESS_SCALE}")
+        print(f"   Frame Skip: {FRAME_SKIP}")
+        print(f"   Server:     http://localhost:5000")
+        print("=" * 60)
         app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
     else:
         print("❌ Startup failed: Camera could not be initialized")
