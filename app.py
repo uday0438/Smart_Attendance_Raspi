@@ -9,8 +9,13 @@ import time
 import pandas as pd
 import numpy as np
 from contextlib import contextmanager
-from flask import Flask, Response, request, jsonify, send_from_directory
+from flask import Flask, Response, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
+import webbrowser
+import io
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
 
 # =============================================================================
 # CONFIGURATION — tune these for your environment
@@ -22,20 +27,21 @@ INTRUDER_DIR = os.path.join(DATASET_DIR, "intruders")
 if not os.path.exists(IMAGES_DIR): os.makedirs(IMAGES_DIR)
 if not os.path.exists(INTRUDER_DIR): os.makedirs(INTRUDER_DIR)
 CAMERA_INDEX = 0
-
-# --- Accuracy knobs ---
-RECOGNITION_TOLERANCE = 0.48       
-PROCESS_SCALE = 0.25                # Ultra-fast detection (at cost of distance accuracy)
+MIRROR_MODE = True                 # Set to True for laptop mirror effect
+# Raspberry Pi IP Camera for remote monitoring:
+# CAMERA_INDEX = "http://10.22.178.171:5000/video_feed"
+RECOGNITION_TOLERANCE = 0.44       
+PROCESS_SCALE = 0.5                # High-accuracy detection
 NUM_JITTERS = 1                    
-REG_SAMPLES_TARGET = 10           
-REG_SAMPLES_MIN = 3                
+REG_SAMPLES_TARGET = 5            
+REG_SAMPLES_MIN = 2                
 REG_NUM_JITTERS = 1                
 REG_TIMEOUT = 10                   
 DETECTION_MODEL = "hog"            
 CAMERA_WIDTH = 640                 
 CAMERA_HEIGHT = 480
-STREAM_FPS = 30                    # Smoother stream
-JPEG_QUALITY = 45                  # Low quality = max speed
+STREAM_FPS = 20                    # Reduced for wireless stability
+JPEG_QUALITY = 40                  # Optimized for low-latency transmission
 
 # =============================================================================
 # DATABASE MANAGER
@@ -68,6 +74,8 @@ class DatabaseManager:
                 status TEXT DEFAULT 'Present',
                 timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
                 method TEXT DEFAULT 'Auto',
+                session_type TEXT DEFAULT 'Active Session',
+                intruder_image TEXT,
                 PRIMARY KEY (id, date, period))""")
             cur.execute("""CREATE TABLE IF NOT EXISTS timetable(
                 period TEXT PRIMARY KEY,
@@ -78,37 +86,72 @@ class DatabaseManager:
 
 
 # =============================================================================
-# CAMERA MANAGER — higher resolution for better face detail
+# CAMERA MANAGER — zero-buffer background reader
 # =============================================================================
 class CameraManager:
+    """Zero-Buffer Background Reader for network streams to eliminate lag."""
     def __init__(self, index=0):
         self.index = index
         self.cam = None
         self.lock = threading.Lock()
+        self.latest_frame = None
+        self.success = False
+        self.running = False
+        self.thread = None
 
     def start(self):
         with self.lock:
             if self.cam is None or not self.cam.isOpened():
-                for idx in [self.index, 0, 1, 2]:
-                    print(f"Trying camera index {idx}...")
-                    self.cam = cv2.VideoCapture(idx)
-                    if self.cam.isOpened():
-                        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-                        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-                        print(f"Camera found and started at index {idx}")
-                        self.index = idx
-                        return True
-                print("All camera indices failed.")
-        return False
+                # Use DirectShow on Windows for much faster/reliable webcam access
+                if isinstance(self.index, int) and os.name == 'nt':
+                    self.cam = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+                else:
+                    self.cam = cv2.VideoCapture(self.index)
+                
+                if self.cam.isOpened():
+                    # Set resolution explicitly
+                    self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    self.cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    
+                    self.running = True
+                    self.thread = threading.Thread(target=self._reader, daemon=True)
+                    self.thread.start()
+                    print(f"Camera {self.index} background reader active (DSHOW Optimized)")
+                else:
+                    print(f"FAILED to open camera {self.index}")
+        return self.cam.isOpened() if self.cam else False
+
+    def _reader(self):
+        """Continuously grab frames and flush the buffer to maintain zero lag."""
+        while self.running:
+            if self.cam and self.cam.isOpened():
+                # Rapid-flush the buffer: grab everything currently in flight
+                # but only retrieve the absolute latest one.
+                for _ in range(5):
+                    self.cam.grab()
+                
+                ret, frame = self.cam.retrieve()
+                if ret:
+                    # Mirror the frame horizontally if enabled
+                    if MIRROR_MODE:
+                        frame = cv2.flip(frame, 1)
+                    
+                    with self.lock:
+                        self.latest_frame = frame
+                        self.success = True
+                else:
+                    time.sleep(0.01)
+            else:
+                break
 
     def get_frame(self):
         with self.lock:
-            if self.cam and self.cam.isOpened():
-                success, frame = self.cam.read()
-                return success, frame
-        return False, None
+            return self.success, self.latest_frame
 
     def stop(self):
+        self.running = False
+        if self.thread: self.thread.join(timeout=1.0)
         with self.lock:
             if self.cam:
                 self.cam.release()
@@ -303,6 +346,16 @@ class AttendanceService:
             conn.commit()
         return f"Marked {count} students present"
 
+    def get_history(self):
+        with self.db.get_connection() as conn:
+            df = pd.read_sql_query("SELECT * FROM attendance ORDER BY timestamp DESC", conn)
+        return df.to_dict('records')
+
+    def get_students(self):
+        with self.db.get_connection() as conn:
+            df = pd.read_sql_query("SELECT id, name FROM students", conn)
+        return df.to_dict('records')
+
 
 # =============================================================================
 # INITIALIZE
@@ -431,8 +484,8 @@ class DetectionThread:
             except Exception as e:
                 print(f"Detection Loop Error: {e}")
 
-            # Sleep longer to reduce CPU load on Raspberry Pi
-            time.sleep(0.5)
+            # Increased detection frequency for ultra-responsiveness
+            time.sleep(0.15)
 
 
 detection_thread = DetectionThread(attendance_svc, cam_mgr)
@@ -443,6 +496,30 @@ detection_thread = DetectionThread(attendance_svc, cam_mgr)
 # =============================================================================
 app = Flask(__name__)
 CORS(app)
+
+@app.route('/api/database/clear_session', methods=['POST'])
+def clear_session():
+    """Wipe today's attendance records for a fresh start."""
+    with db_mgr.get_connection() as conn:
+        conn.execute("DELETE FROM attendance WHERE date = date('now')")
+        conn.commit()
+    return jsonify({"success": True, "message": "Attendance database refreshed for today."})
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if not os.path.exists('dist'):
+        return """
+        <div style='font-family: sans-serif; text-align: center; margin-top: 100px;'>
+            <h1 style='color: #ef4444;'>Frontend Not Found</h1>
+            <p>Please build the project using <code>npm run build</code> or ensure the <code>dist</code> folder exists.</p>
+        </div>
+        """, 404
+    
+    if path != "" and os.path.exists(os.path.join('dist', path)):
+        return send_from_directory('dist', path)
+    else:
+        return send_from_directory('dist', 'index.html')
 
 
 def gen_frames():
@@ -540,6 +617,17 @@ def list_students():
     return jsonify(df.to_dict('records'))
 
 
+@app.route('/api/camera/refresh', methods=['POST'])
+def refresh_camera():
+    global cam_mgr, detection_thread
+    print(">>> Refreshing camera system...")
+    cam_mgr.stop()
+    time.sleep(1)
+    if cam_mgr.start():
+        return jsonify({"status": "success", "message": "Camera re-initialized"}), 200
+    return jsonify({"status": "error", "message": "Camera re-initialization failed"}), 500
+
+
 @app.route('/api/students/<student_id>', methods=['DELETE'])
 def delete_student(student_id):
     with db_mgr.get_connection() as conn:
@@ -593,6 +681,13 @@ def get_attendance():
     return jsonify(df.to_dict('records'))
 
 
+def reg_preprocess(frame):
+    """Deep-preprocessor for high-accuracy registration samples."""
+    # Convert BGR to RGB (required by face_recognition)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return rgb
+
+
 # Registration progress (thread-safe for polling)
 _reg_progress = {
     "active": False, "samples": 0, "target": 5, "name": "",
@@ -603,7 +698,7 @@ _reg_lock = threading.Lock()
 # 3D capture phases — 4 samples per pose × 5 poses = 20 samples
 # Fast capture: 5 samples from front
 REG_PHASES = [
-    {"name": "Front", "instruction": "Look straight at the camera", "samples": 10},
+    {"name": "Front", "instruction": "Detecting Face...", "samples": 5},
 ]
 
 
@@ -638,15 +733,12 @@ def register_student():
         })
 
     # PAUSE detection thread so registration gets exclusive camera access
-    detection_thread.pause()
-    time.sleep(0.3)
-
+    # Flush stale frames (Reduced)
     all_encodings = []
-    print(f"Starting 3D capture for {name} (ID: {sid}) -- {len(REG_PHASES)} phases, {total_target} samples")
-
-    # Flush stale frames
-    for _ in range(10):
+    for _ in range(3):
         cam_mgr.get_frame()
+    
+    print(f"Starting 3D capture for {name} (ID: {sid}) -- {len(REG_PHASES)} phases, {total_target} samples")
 
     start_time = time.time()
 
@@ -662,8 +754,7 @@ def register_student():
 
         print(f"  Phase {phase_idx+1}/{len(REG_PHASES)}: {phase_name} -- \"{phase_instruction}\"")
 
-        # Give user 1.0 seconds to adjust their head
-        time.sleep(1.0)
+        # Instant start
 
         phase_encodings = []
         best_frame = None
@@ -767,23 +858,97 @@ def reg_preprocess(frame):
 
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
-if __name__ == "__main__":
-    if cam_mgr.start():
-        detection_thread.start()
-        print("=" * 60)
-        print("ClassLens AI Backend -- Threaded Detection")
-        print(f"   Camera:      {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-        print(f"   Model:       {DETECTION_MODEL}")
-        print(f"   Tolerance:   {RECOGNITION_TOLERANCE}")
-        print(f"   Scale:       {PROCESS_SCALE} ({int(CAMERA_WIDTH*PROCESS_SCALE)}x{int(CAMERA_HEIGHT*PROCESS_SCALE)} detection)")
-        print(f"   Stream FPS:  {STREAM_FPS}")
-        print(f"   Architecture: Background thread (zero-lag overlay)")
-        print(f"   Server:      http://localhost:5000")
-        print("=" * 60)
-        app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
-    else:
-        print("Startup failed: Camera could not be initialized")
+@app.route('/api/reports/daily')
+def daily_report():
+    date_str = str(datetime.date.today())
+    records = attendance_svc.get_history()
+    today_records = [r for r in records if r['date'] == date_str]
+    students = attendance_svc.get_students()
+    absentees = [s for s in students if not any(r['id'] == s['id'] for r in today_records)]
+    intruders = [r for r in today_records if r['method'] == 'SECURITY']
+    
+    buffer = io.BytesIO()
+    p = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    
+    # Header
+    p.setFillColor(colors.blue)
+    p.rect(0, height - 80, width, 80, fill=True, stroke=False)
+    p.setFillColor(colors.white)
+    p.setFont("Helvetica-Bold", 24)
+    p.drawString(40, height - 50, "ClassLens Daily Analytics")
+    p.setFont("Helvetica", 12)
+    p.drawString(40, height - 70, f"Report Date: {date_str}  |  Kuppam Engineering College")
+    
+    # Summary
+    p.setFillColor(colors.black)
+    p.setFont("Helvetica-Bold", 14)
+    p.drawString(40, height - 120, "1. Executive Summary")
+    p.setFont("Helvetica", 12)
+    p.drawString(60, height - 140, f"- Total Registered Students: {len(students)}")
+    p.drawString(60, height - 160, f"- Active Today: {len(today_records)}")
+    p.drawString(60, height - 180, f"- Absentees: {len(absentees)}")
+    p.drawString(60, height - 200, f"- Security Alerts: {len(intruders)}")
+    
+    # Absentees Table
+    p.setFont("Helvetica-Bold", 14)
+    p.drawString(40, height - 240, "2. Absentee List")
+    p.line(40, height - 245, width - 40, height - 245)
+    
+    y = height - 270
+    p.setFont("Helvetica-Bold", 10)
+    p.drawString(60, y, "Student ID")
+    p.drawString(200, y, "Name")
+    y -= 20
+    p.setFont("Helvetica", 10)
+    for s in absentees[:20]: # Limit for single page demo
+        p.drawString(60, y, s['id'])
+        p.drawString(200, y, s['name'])
+        y -= 20
+        if y < 100: break
+    
+    p.showPage()
+    p.save()
+    
+    buffer.seek(0)
+    return send_file(buffer, as_attachment=True, download_name=f"Report_{date_str}.pdf", mimetype='application/pdf')
 
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+def open_browser():
+    """Wait for the server to start, then open the dashboard."""
+    time.sleep(3)
+    print("\n>>> Launching ClassLens Dashboard...")
+    try:
+        webbrowser.open("http://127.0.0.1:5000")
+    except Exception as e:
+        print(f"Failed to open browser: {e}")
+
+if __name__ == "__main__":
+    # 1. Start Camera
+    has_cam = cam_mgr.start()
+    
+    # 2. Start Detection Thread if camera is online
+    if has_cam:
+        detection_thread.start()
+    
+    # 3. Open dashboard in a separate thread
+    threading.Thread(target=open_browser, daemon=True).start()
+    
+    # 4. Startup Banner
+    print("\n" + "="*60)
+    print("  ClassLens AI Attendance System -- RASPBERRY PI EDITION")
+    print("  Backend & Dashboard: http://127.0.0.1:5000")
+    print(f"  Camera Status:      {'ONLINE' if has_cam else 'OFFLINE (Check connection)'}")
+    print("  Press Ctrl+C to stop the server.")
+    print("="*60 + "\n")
+    
+    # 5. Run Flask
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\nStopping ClassLens...")
+        cam_mgr.stop()
+        detection_thread.stop()

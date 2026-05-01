@@ -1,35 +1,68 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "Inter", "Roboto", "Outfit", sans-serif;
+  --font-mono: "Fira Code", monospace;
+}
+
+:root {
+  --bg-image: url('/background.png');
+  --panel-bg: rgba(0, 0, 0, 0.4);
+  --panel-border: rgba(255, 255, 255, 0.05);
+  --text-primary: #ffffff;
+  --text-secondary: #9ca3af;
+  --accent-color: #3b82f6;
+}
+
+[data-theme='light'] {
+  --panel-bg: rgba(255, 255, 255, 0.8);
+  --panel-border: rgba(0, 0, 0, 0.1);
+  --text-primary: #111827;
+  --text-secondary: #4b5563;
+  --accent-color: #2563eb;
+}
+
 body {
   margin: 0;
   padding: 0;
-  background-image: linear-gradient(rgba(0,0,0,0.8), rgba(0,0,0,0.8)), url('/background.png');
+  min-height: 100vh;
+  background-image: linear-gradient(rgba(0,0,0,0.5), rgba(0,0,0,0.7)), var(--bg-image);
   background-size: cover;
   background-position: center;
   background-attachment: fixed;
-  background-repeat: no-repeat;
-  min-height: 100vh;
-  background-color: #000;
-  color: #fff;
+  color: var(--text-primary);
+  transition: all 0.3s ease;
 }
 
-#root {
-  min-height: 100vh;
+[data-theme='light'] body {
+  background-image: linear-gradient(rgba(255,255,255,0.8), rgba(255,255,255,0.7)), var(--bg-image);
 }
 
-/* Glassmorphism for containers */
 .glass-panel {
-  background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--panel-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--panel-border);
+  transition: all 0.3s ease;
 }
 
 @keyframes scan {
-  0%, 100% { top: 0%; }
-  50% { top: calc(100% - 4px); }
+  from { transform: translateY(0); }
+  to { transform: translateY(100%); }
 }
 
 .animate-scan {
-  animation: scan 2s ease-in-out infinite;
+  animation: scan 2s linear infinite;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.1);
+  border-radius: 10px;
 }
